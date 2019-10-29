@@ -32,6 +32,26 @@ final class KafkaPropagation {
   static final Headers B3_SINGLE_TEST_HEADERS =
     TEST_RECORD.headers().add("b3", writeB3SingleFormat(TEST_CONTEXT).getBytes(UTF_8));
 
+  static final Injector<KafkaProducerRequest> B3_SINGLE_INJECTOR_PRODUCER =
+    new Injector<KafkaProducerRequest>() {
+      @Override public void inject(TraceContext traceContext, KafkaProducerRequest request) {
+        B3_SINGLE_INJECTOR.inject(traceContext, request.delegate.headers());
+      }
+
+      @Override public String toString() {
+        return B3_SINGLE_INJECTOR.toString();
+      }
+    };
+  static final Injector<KafkaConsumerRequest> B3_SINGLE_INJECTOR_CONSUMER =
+    new Injector<KafkaConsumerRequest>() {
+      @Override public void inject(TraceContext traceContext, KafkaConsumerRequest request) {
+        B3_SINGLE_INJECTOR.inject(traceContext, request.delegate.headers());
+      }
+
+      @Override public String toString() {
+        return B3_SINGLE_INJECTOR.toString();
+      }
+    };
   static final Injector<Headers> B3_SINGLE_INJECTOR = new Injector<Headers>() {
     @Override public void inject(TraceContext traceContext, Headers carrier) {
       carrier.add("b3", writeB3SingleFormatWithoutParentIdAsBytes(traceContext));

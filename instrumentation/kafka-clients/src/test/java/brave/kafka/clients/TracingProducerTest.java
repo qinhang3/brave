@@ -18,7 +18,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.producer.MockProducer;
-import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.header.Header;
 import org.junit.Test;
@@ -31,7 +30,8 @@ import static org.assertj.core.api.Assertions.entry;
 public class TracingProducerTest extends BaseTracingTest {
   MockProducer<Object, String> mockProducer = new MockProducer<>();
   KafkaTracing kafkaTracing = KafkaTracing.create(tracing);
-  Producer<Object, String> tracingProducer = kafkaTracing.producer(mockProducer);
+  TracingProducer<Object, String> tracingProducer =
+    (TracingProducer<Object, String>) kafkaTracing.producer(mockProducer);
 
   @Test public void should_add_b3_headers_to_records() {
     tracingProducer.send(new ProducerRecord<>(TEST_TOPIC, TEST_KEY, TEST_VALUE));
@@ -83,7 +83,7 @@ public class TracingProducerTest extends BaseTracingTest {
   @Test public void should_add_parent_trace_when_context_injected_on_headers() {
     brave.Span span = tracing.tracer().newTrace().start();
     ProducerRecord<Object, String> record = new ProducerRecord<>(TEST_TOPIC, TEST_KEY, TEST_VALUE);
-    kafkaTracing.injector.inject(span.context(), record.headers());
+    tracingProducer.injector.inject(span.context(), new KafkaProducerRequest(record));
     span.finish();
 
     tracingProducer.send(record);
@@ -100,7 +100,9 @@ public class TracingProducerTest extends BaseTracingTest {
   }
 
   @Test public void should_add_b3_single_header_to_message() {
-    tracingProducer = KafkaTracing.newBuilder(tracing).writeB3SingleFormat(true).build()
+    tracingProducer = (TracingProducer<Object, String>) KafkaTracing.newBuilder(tracing)
+      .writeB3SingleFormat(true)
+      .build()
       .producer(mockProducer);
 
     tracingProducer.send(new ProducerRecord<>(TEST_TOPIC, TEST_KEY, TEST_VALUE));

@@ -15,7 +15,9 @@ package brave.kafka.clients;
 
 import brave.Span;
 import brave.SpanCustomizer;
+import brave.Tracer;
 import brave.Tracing;
+import brave.messaging.MessagingRequest;
 import brave.messaging.MessagingTracing;
 import brave.propagation.B3SingleFormat;
 import brave.propagation.Propagation;
@@ -23,6 +25,7 @@ import brave.propagation.TraceContext;
 import brave.propagation.TraceContext.Extractor;
 import brave.propagation.TraceContext.Injector;
 import brave.propagation.TraceContextOrSamplingFlags;
+import brave.sampler.SamplerFunction;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -33,7 +36,6 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
 
-import static brave.kafka.clients.KafkaPropagation.B3_SINGLE_TEST_HEADERS;
 import static brave.kafka.clients.KafkaPropagation.TEST_CONTEXT;
 
 /** Use this class to decorate your Kafka consumer / producer and enable Tracing. */
@@ -78,8 +80,13 @@ public final class KafkaTracing {
     /**
      * When true, only writes a single {@link B3SingleFormat b3 header} for outbound propagation.
      *
-     * <p>Use this to reduce overhead. Note: normal {@link Tracing#propagation()} is used to parse
-     * incoming headers. The implementation must be able to read "b3" headers.
+     * <p>Note: normal {@link Tracing#propagation()} is used to parse incoming headers. The
+     * consuming implementation must be able to read "b3" headers.
+     *
+     * <h3>This breaks any custom injection logic!</h3>
+     * The only reason to use this is to reduce overhead. Using this renders any customizations made
+     * in {@link Tracing.Builder#propagationFactory(Propagation.Factory)}. For example, this flag
+     * skips any custom injection logic such as secondary sampling. For this reason, use caution.
      */
     public Builder writeB3SingleFormat(boolean writeB3SingleFormat) {
       this.writeB3SingleFormat = writeB3SingleFormat;
@@ -91,27 +98,40 @@ public final class KafkaTracing {
     }
   }
 
-  final Tracing tracing;
-  final Extractor<Headers> extractor;
-  final Injector<Headers> injector;
+  final MessagingTracing messagingTracing;
+  final Tracer tracer;
+  final Extractor<KafkaProducerRequest> producerExtractor;
+  final Extractor<KafkaConsumerRequest> consumerExtractor;
+  final Injector<KafkaProducerRequest> producerInjector;
+  final Injector<KafkaConsumerRequest> consumerInjector;
+  final SamplerFunction<MessagingRequest> producerSampler, consumerSampler;
   final Set<String> propagationKeys;
   final String remoteServiceName;
 
   KafkaTracing(Builder builder) { // intentionally hidden constructor
-    this.tracing = builder.messagingTracing.tracing();
-    this.extractor = tracing.propagation().extractor(KafkaPropagation.GETTER);
-    List<String> keyList = tracing.propagation().keys();
+    this.messagingTracing = builder.messagingTracing;
+    this.tracer = builder.messagingTracing.tracing().tracer();
+    Propagation<String> propagation = messagingTracing.tracing().propagation();
+    this.producerExtractor = propagation.extractor(KafkaProducerRequest::getHeader);
+    this.consumerExtractor = propagation.extractor(KafkaConsumerRequest::getHeader);
+    List<String> keyList = propagation.keys();
     // Use a more efficient injector if we are only propagating a single header
     if (builder.writeB3SingleFormat || keyList.equals(Propagation.B3_SINGLE_STRING.keys())) {
-      TraceContext testExtraction = extractor.extract(B3_SINGLE_TEST_HEADERS).context();
+      TraceContext testExtraction = propagation.extractor(KafkaPropagation.GETTER)
+        .extract(KafkaPropagation.B3_SINGLE_TEST_HEADERS)
+        .context();
       if (!TEST_CONTEXT.equals(testExtraction)) {
         throw new IllegalArgumentException(
           "KafkaTracing.Builder.writeB3SingleFormat set, but Tracing.Builder.propagationFactory cannot parse this format!");
       }
-      this.injector = KafkaPropagation.B3_SINGLE_INJECTOR;
+      this.producerInjector = KafkaPropagation.B3_SINGLE_INJECTOR_PRODUCER;
+      this.consumerInjector = KafkaPropagation.B3_SINGLE_INJECTOR_CONSUMER;
     } else {
-      this.injector = tracing.propagation().injector(KafkaPropagation.SETTER);
+      this.producerInjector = propagation.injector(KafkaProducerRequest::setHeader);
+      this.consumerInjector = propagation.injector(KafkaConsumerRequest::setHeader);
     }
+    this.producerSampler = messagingTracing.producerSampler();
+    this.consumerSampler = messagingTracing.consumerSampler();
     this.propagationKeys = new LinkedHashSet<>(keyList);
     this.remoteServiceName = builder.remoteServiceName;
   }
@@ -140,21 +160,39 @@ public final class KafkaTracing {
    * one couldn't be extracted.
    */
   public Span nextSpan(ConsumerRecord<?, ?> record) {
-    TraceContextOrSamplingFlags extracted = extractAndClearHeaders(record.headers());
-    Span result = tracing.tracer().nextSpan(extracted);
+    KafkaConsumerRequest request = new KafkaConsumerRequest(record);
+    TraceContextOrSamplingFlags extracted =
+      extractAndClearHeaders(consumerExtractor, request, record.headers());
+    Span result = nextSpan(consumerSampler, request, extracted);
     if (extracted.context() == null && !result.isNoop()) {
       addTags(record, result);
     }
     return result;
   }
 
-  TraceContextOrSamplingFlags extractAndClearHeaders(Headers headers) {
-    TraceContextOrSamplingFlags extracted = extractor.extract(headers);
-    // clear propagation headers if we were able to extract a span
+  <R extends MessagingRequest> TraceContextOrSamplingFlags extractAndClearHeaders(
+    Extractor<R> extractor, R request, Headers headers
+  ) {
+    TraceContextOrSamplingFlags extracted = extractor.extract(request);
+    // Clear any propagation keys present in the headers
     if (!extracted.equals(TraceContextOrSamplingFlags.EMPTY)) {
       clearHeaders(headers);
     }
     return extracted;
+  }
+
+  /** Creates a potentially noop span representing this request */
+  Span nextSpan(
+    SamplerFunction<MessagingRequest> sampler,
+    MessagingRequest request,
+    TraceContextOrSamplingFlags extracted
+  ) {
+    Boolean sampled = extracted.sampled();
+    // only recreate the context if the messaging sampler made a decision
+    if (sampled == null && (sampled = sampler.trySample(request)) != null) {
+      extracted = extracted.sampled(sampled.booleanValue());
+    }
+    return tracer.nextSpan(extracted);
   }
 
   // BRAVE6: consider a messaging variant of extraction which clears headers as they are read.

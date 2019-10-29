@@ -15,6 +15,8 @@ package brave.kafka.clients;
 
 import brave.Tracing;
 import brave.internal.HexCodec;
+import brave.messaging.MessagingRuleSampler;
+import brave.messaging.MessagingTracing;
 import brave.propagation.Propagation;
 import brave.propagation.SamplingFlags;
 import brave.propagation.StrictScopeDecorator;
@@ -22,6 +24,8 @@ import brave.propagation.ThreadLocalCurrentTraceContext;
 import brave.propagation.TraceContext;
 import brave.propagation.TraceContextOrSamplingFlags;
 import brave.propagation.TraceIdContext;
+import brave.sampler.RateLimitingSampler;
+import brave.sampler.Sampler;
 import com.github.charithe.kafka.EphemeralKafkaBroker;
 import com.github.charithe.kafka.KafkaJunitRule;
 import java.util.ArrayList;
@@ -51,6 +55,10 @@ import zipkin2.Span;
 import zipkin2.internal.DependencyLinker;
 
 import static brave.kafka.clients.KafkaTags.KAFKA_TOPIC_TAG;
+import static brave.messaging.MessagingRequestMatchers.channelNameEquals;
+import static brave.messaging.MessagingRequestMatchers.operationEquals;
+import static brave.sampler.Sampler.ALWAYS_SAMPLE;
+import static brave.sampler.Sampler.NEVER_SAMPLE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.groups.Tuple.tuple;
 
@@ -285,6 +293,53 @@ public class ITKafkaTracing {
 
       assertThat(forProcessor.traceIdString()).isEqualTo(consumerSpan.traceId());
     }
+  }
+
+  @Test public void customSampler_producer() throws Exception {
+    String topic = testName.getMethodName();
+
+    producerTracing = KafkaTracing.create(MessagingTracing.newBuilder(
+      Tracing.newBuilder().spanReporter(producerSpans::add).build()
+    ).producerSampler(MessagingRuleSampler.newBuilder()
+      .putRule(channelNameEquals(topic), Sampler.NEVER_SAMPLE)
+      .build()).build());
+
+    producer = createTracingProducer();
+    consumer = createTracingConsumer();
+
+    producer.send(new ProducerRecord<>(topic, TEST_KEY, TEST_VALUE)).get();
+
+    // intentionally using deprecated method as we are checking the same class in an invoker test
+    // under src/it. If we want to explicitly tests the Duration arg, we will have to subclass.
+    ConsumerRecords<String, String> records = consumer.poll(10_000L);
+
+    assertThat(records).hasSize(1);
+
+    // since the producer was unsampled, the consumer should be unsampled also due to propagation
+
+    // @After will also check that both the producer and consumer were not sampled
+  }
+  @Test public void customSampler_consumer() throws Exception {
+    String topic = testName.getMethodName();
+
+    consumerTracing = KafkaTracing.create(MessagingTracing.newBuilder(
+      Tracing.newBuilder().spanReporter(consumerSpans::add).build()
+    ).consumerSampler(MessagingRuleSampler.newBuilder()
+      .putRule(operationEquals("receive"), Sampler.NEVER_SAMPLE)
+      .build()).build());
+
+    producer = kafkaRule.helper().createStringProducer(); // intentionally don't trace the producer
+    consumer = createTracingConsumer();
+
+    producer.send(new ProducerRecord<>(topic, TEST_KEY, TEST_VALUE)).get();
+
+    // intentionally using deprecated method as we are checking the same class in an invoker test
+    // under src/it. If we want to explicitly tests the Duration arg, we will have to subclass.
+    ConsumerRecords<String, String> records = consumer.poll(10_000L);
+
+    assertThat(records).hasSize(1);
+
+    // @After will also check that both the consumer was not sampled
   }
 
   Consumer<String, String> createTracingConsumer(String... topics) {
